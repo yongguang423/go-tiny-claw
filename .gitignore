@@ -1,0 +1,8 @@
+# 编译产物
+/claw
+
+# IDE
+.vscode/
+
+# 系统文件
+.DS_Store
