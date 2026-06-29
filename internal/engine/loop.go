@@ -6,17 +6,18 @@ import (
 	"log"
 	"sync"
 
+	ctxpkg "github.com/yongguang423/go-tiny-claw/internal/context"
 	"github.com/yongguang423/go-tiny-claw/internal/provider"
 	"github.com/yongguang423/go-tiny-claw/internal/schema"
 	"github.com/yongguang423/go-tiny-claw/internal/tools"
 )
 
-// AgentEngine 是微型 OS 的核心驱动
 type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
 	WorkDir        string
-	EnableThinking bool // 【新增】慢思考模式开关
+	EnableThinking bool
+	composer       *ctxpkg.PromptComposer // 【新增】
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, enableThinking bool) *AgentEngine {
@@ -25,72 +26,57 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, en
 		registry:       r,
 		WorkDir:        workDir,
 		EnableThinking: enableThinking,
+		composer:       ctxpkg.NewPromptComposer(workDir), // 【初始化】
 	}
 }
 
-
-
 func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Reporter) error {
 	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
-	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
+
+	// 【核心修改】动态组装 System Prompt
+	systemMsg := e.composer.Build()
 
 	contextHistory := []schema.Message{
-		{
-			Role:    schema.RoleSystem,
-			Content: "You are go-tiny-claw, an expert coding assistant. You have full access to tools in the workspace.",
-		},
-		{
-			Role:    schema.RoleUser,
-			Content: userPrompt,
-		},
+		systemMsg,
+		{Role: schema.RoleUser, Content: userPrompt},
 	}
 
-	turnCount := 0
-
 	for {
-		turnCount++
-		log.Printf("\n========== [Turn %d] 开始 ==========\n", turnCount)
-
 		availableTools := e.registry.GetAvailableTools()
 
-		// Phase 1: 慢思考阶段
+		// Phase 1: Thinking
 		if e.EnableThinking {
-			log.Println("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
-			reporter.OnThinking(ctx)
+			if reporter != nil {
+				reporter.OnThinking(ctx)
+			}
+
 			thinkResp, err := e.provider.Generate(ctx, contextHistory, nil)
 			if err != nil {
-				return fmt.Errorf("Thinking 阶段生成失败: %w", err)
+				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
 			if thinkResp.Content != "" {
-				fmt.Printf("🧠 [内部思考 Trace]: \n%s\n", thinkResp.Content)
 				contextHistory = append(contextHistory, *thinkResp)
 			}
 		}
 
-		// Phase 2: 行动阶段
-		log.Println("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+		// Phase 2: Action
 		actionResp, err := e.provider.Generate(ctx, contextHistory, availableTools)
 		if err != nil {
-			return fmt.Errorf("Action 阶段生成失败: %w", err)
+			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
 
 		contextHistory = append(contextHistory, *actionResp)
 
-		if actionResp.Content != "" {
-			fmt.Printf("🤖 [对外回复]: \n%s\n", actionResp.Content)
+		if actionResp.Content != "" && reporter != nil {
 			reporter.OnMessage(ctx, actionResp.Content)
 		}
 
+		// 检查结束
 		if len(actionResp.ToolCalls) == 0 {
-			log.Println("[Engine] 模型未请求调用工具，任务宣告完成。")
 			break
 		}
 
-		log.Printf("[Engine] 模型请求并发调用 %d 个工具...\n", len(actionResp.ToolCalls))
-
-		// ================= 并发执行逻辑 =================
-
-		// 预分配切片以保证顺序并避免并发写入锁
+		// 执行并发工具调用
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
@@ -100,26 +86,20 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 			go func(idx int, call schema.ToolCall) {
 				defer wg.Done()
 
-				// 在主循环汇报"准备调用工具"——注意 args 字段当前是 raw JSON
-				// (call.Arguments 在不同模型格式下可能为 map[string]any，
-				//  若需展示字符串形式由调用方在 reporter 内自行序列化)
-				reporter.OnToolCall(ctx, call.Name, fmt.Sprintf("%v", call.Arguments))
-
-				log.Printf("  -> [Go-%d] 🛠️ 触发并行执行: %s\n", idx, call.Name)
-
-				// 执行底层工具
-				result := e.registry.Execute(ctx, call)
-
-				if result.IsError {
-					log.Printf("  -> [Go-%d] ❌ 工具执行报错: %s\n", idx, result.Output)
-				} else {
-					log.Printf("  -> [Go-%d] ✅ 工具执行成功 (返回 %d 字节)\n", idx, len(result.Output))
+				if reporter != nil {
+					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
 				}
 
-				// 把执行结果汇报给 reporter (飞书/终端等)
-				reporter.OnToolResult(ctx, call.Name, result.Output, result.IsError)
+				result := e.registry.Execute(ctx, call)
 
-				// 安全写入对应索引
+				if reporter != nil {
+					displayOutput := result.Output
+					if len(displayOutput) > 200 {
+						displayOutput = displayOutput[:200] + "... (已截断)"
+					}
+					reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
+				}
+
 				observationMsgs[idx] = schema.Message{
 					Role:       schema.RoleUser,
 					Content:    result.Output,
@@ -128,10 +108,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 			}(i, toolCall)
 		}
 
-		wg.Wait() // 阻塞聚合
-		log.Println("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
+		wg.Wait()
 
-		// 按序追加回 Context
 		for _, obs := range observationMsgs {
 			contextHistory = append(contextHistory, obs)
 		}
