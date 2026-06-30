@@ -1,3 +1,4 @@
+// internal/engine/loop.go
 package engine
 
 import (
@@ -15,36 +16,38 @@ import (
 type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
-	WorkDir        string
 	EnableThinking bool
-	composer       *ctxpkg.PromptComposer // 【新增】
 }
 
-func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, enableThinking bool) *AgentEngine {
+// 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
+func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool) *AgentEngine {
 	return &AgentEngine{
 		provider:       p,
 		registry:       r,
-		WorkDir:        workDir,
 		EnableThinking: enableThinking,
-		composer:       ctxpkg.NewPromptComposer(workDir), // 【初始化】
 	}
 }
 
-func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Reporter) error {
-	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
+// 【核心改造】: 移除 userPrompt 参数，改为接收一个具体的 Session 实例
+func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter Reporter) error {
+	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
 
-	// 【核心修改】动态组装 System Prompt
-	systemMsg := e.composer.Build()
-
-	contextHistory := []schema.Message{
-		systemMsg,
-		{Role: schema.RoleUser, Content: userPrompt},
-	}
+	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
+	composer := ctxpkg.NewPromptComposer(session.WorkDir)
+	systemMsg := composer.Build()
 
 	for {
 		availableTools := e.registry.GetAvailableTools()
 
-		// Phase 1: Thinking
+		// 1. 【上下文组装】: System Prompt + 截取最近的 6 条消息作为 Working Memory
+		// 在实际业务中，由于工具返回结果可能很长，短期工作记忆往往设为 6-10 条足以维系连贯对话
+		workingMemory := session.GetWorkingMemory(6)
+
+		var contextHistory []schema.Message
+		contextHistory = append(contextHistory, systemMsg)
+		contextHistory = append(contextHistory, workingMemory...)
+
+		// 2. ================= Phase 1: Thinking =================
 		if e.EnableThinking {
 			if reporter != nil {
 				reporter.OnThinking(ctx)
@@ -55,28 +58,33 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
 			if thinkResp.Content != "" {
+				// 将思考过程持久化到 Session 中！
+				session.Append(*thinkResp)
+				// 把它追加到当前这一轮的临时上下文中，供 Action 阶段使用
 				contextHistory = append(contextHistory, *thinkResp)
 			}
 		}
 
-		// Phase 2: Action
+		// 3. ================= Phase 2: Action =================
 		actionResp, err := e.provider.Generate(ctx, contextHistory, availableTools)
 		if err != nil {
 			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
 
+		// 将大模型的行动响应持久化到 Session 中
+		session.Append(*actionResp)
 		contextHistory = append(contextHistory, *actionResp)
 
 		if actionResp.Content != "" && reporter != nil {
 			reporter.OnMessage(ctx, actionResp.Content)
 		}
 
-		// 检查结束
 		if len(actionResp.ToolCalls) == 0 {
+			// 如果没有工具调用，说明本次任务已完成，打破 ReAct 循环，挂起等待人类的下一条指令
 			break
 		}
 
-		// 执行并发工具调用
+		// 4. ================= 并发执行底层工具 =================
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
@@ -110,9 +118,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 
 		wg.Wait()
 
-		for _, obs := range observationMsgs {
-			contextHistory = append(contextHistory, obs)
-		}
+		// 将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
+		session.Append(observationMsgs...)
 	}
 
 	return nil

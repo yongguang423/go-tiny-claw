@@ -31,10 +31,10 @@ func main() {
 	registry.Register(tools.NewEditFileTool(workDir))
 
 	// 开启慢思考
-	eng := engine.NewAgentEngine(llmProvider, registry, workDir, true)
+	eng := engine.NewAgentEngine(llmProvider, registry, true)
 
 	// 2. 初始化飞书 Bot（内部会读取 FEISHU_APP_ID / FEISHU_APP_SECRET）
-	bot := feishu.NewFeishuBot(eng)
+	bot := feishu.NewFeishuBot(eng, workDir)
 
 	// 3. 启动 WebSocket 长连接（本地无需公网/域名，程序主动连飞书）
 	ctx, cancel := context.WithCancel(context.Background())

@@ -13,7 +13,9 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+	ctxpkg "github.com/yongguang423/go-tiny-claw/internal/context"
 	"github.com/yongguang423/go-tiny-claw/internal/engine"
+	"github.com/yongguang423/go-tiny-claw/internal/schema"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 )
@@ -24,9 +26,12 @@ type FeishuBot struct {
 	appID     string
 	appSecret string
 	engine    *engine.AgentEngine // 持有核心引擎引用
+	workDir   string              // 该机器人绑定的工作区
 }
 
-func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
+// NewFeishuBot 创建一个飞书机器人实例。
+// workDir 指定该机器人响应消息时的工作区路径。
+func NewFeishuBot(eng *engine.AgentEngine, workDir string) *FeishuBot {
 	appID := os.Getenv("FEISHU_APP_ID")
 	appSecret := os.Getenv("FEISHU_APP_SECRET")
 
@@ -34,7 +39,6 @@ func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
 		log.Fatal("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
 	}
 
-	// 实例化飞书官方客户端
 	client := lark.NewClient(appID, appSecret)
 
 	return &FeishuBot{
@@ -42,6 +46,7 @@ func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
 		appID:     appID,
 		appSecret: appSecret,
 		engine:    eng,
+		workDir:   workDir,
 	}
 }
 
@@ -89,14 +94,16 @@ func (b *FeishuBot) StartWebSocket(ctx context.Context) error {
 
 // handleAgentRun 是连接飞书与底层引擎的桥梁
 func (b *FeishuBot) handleAgentRun(chatId string, prompt string) {
-	// 为当前聊天窗口实例化一个专属的 Reporter
 	reporter := &FeishuReporter{
 		client: b.client,
 		chatId: chatId,
 	}
 
-	// 启动引擎！
-	err := b.engine.Run(context.Background(), prompt, reporter)
+	// 通过 SessionManager 拿（或建）一个 session，chatId 作为唯一标识
+	session := ctxpkg.GlobalSessionMgr.GetOrCreate(chatId, b.workDir)
+	session.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+
+	err := b.engine.Run(context.Background(), session, reporter)
 	if err != nil {
 		reporter.sendMsg(fmt.Sprintf("❌ Agent 运行崩溃: %v", err))
 	}
